@@ -1,29 +1,30 @@
 import sqlite3
-from datetime import datetime
+import threading
 from contextlib import contextmanager
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 DB_NAME = "trading_app.db"
-_db_connection = None
+_db_lock = threading.RLock()
 
 @contextmanager
 def get_db():
-    """Context manager for database connection reuse.
+    """Context manager for database connection.
     
-    Maintains a persistent connection and ensures proper commit/rollback.
+    Opens a dedicated connection for this operation and serializes access
+    with a lock to ensure thread-safe reads and writes.
     """
-    global _db_connection
-    if _db_connection is None:
-        _db_connection = sqlite3.connect(DB_NAME, check_same_thread=False)
-        # Enable WAL mode for better concurrency
-        _db_connection.execute('PRAGMA journal_mode=WAL')
-    
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
-        yield _db_connection
-        _db_connection.commit()
+        with _db_lock:
+            yield conn
+            conn.commit()
     except Exception:
-        _db_connection.rollback()
+        conn.rollback()
         raise
+    finally:
+        conn.close()
 
 def init_db():
     """Initialize database with optimized schema and indexes."""
@@ -49,10 +50,9 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_strategy ON trades(strategy)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_pnl ON trades(pnl)')
-        conn.commit()
 
 def save_trade(trade):
-    """Save a single trade using persistent connection."""
+    """Save a single trade using a dedicated connection."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute('''
@@ -204,11 +204,8 @@ def get_trade_count() -> int:
         return c.fetchone()[0] or 0
 
 def close_db():
-    """Close the persistent database connection.
+    """No-op for the per-operation connection pattern.
     
-    Call this during application shutdown.
+    Kept for backward compatibility with the main.py shutdown sequence.
     """
-    global _db_connection
-    if _db_connection:
-        _db_connection.close()
-        _db_connection = None
+    pass
