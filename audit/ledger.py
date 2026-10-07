@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
@@ -24,6 +26,29 @@ def get_db():
     except Exception:
         _db_connection.rollback()
         raise
+from typing import List, Optional, Tuple
+
+DB_NAME = "trading_app.db"
+_db_lock = threading.RLock()
+
+@contextmanager
+def get_db():
+    """Context manager for database connection.
+    
+    Opens a dedicated connection for this operation and serializes access
+    with a lock to ensure thread-safe reads and writes.
+    """
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        with _db_lock:
+            yield conn
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     """Initialize database with optimized schema and indexes."""
@@ -53,6 +78,9 @@ def init_db():
 
 def save_trade(trade):
     """Save a single trade using persistent connection."""
+
+def save_trade(trade):
+    """Save a single trade using a dedicated connection."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute('''
@@ -212,3 +240,8 @@ def close_db():
     if _db_connection:
         _db_connection.close()
         _db_connection = None
+    """No-op for the per-operation connection pattern.
+    
+    Kept for backward compatibility with the main.py shutdown sequence.
+    """
+    pass
