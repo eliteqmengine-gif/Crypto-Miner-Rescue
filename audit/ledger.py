@@ -2,43 +2,20 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime
-from contextlib import contextmanager
-from typing import List, Optional, Tuple
-
-DB_NAME = "trading_app.db"
-_db_connection = None
-
-@contextmanager
-def get_db():
-    """Context manager for database connection reuse.
-    
-    Maintains a persistent connection and ensures proper commit/rollback.
-    """
-    global _db_connection
-    if _db_connection is None:
-        _db_connection = sqlite3.connect(DB_NAME, check_same_thread=False)
-        # Enable WAL mode for better concurrency
-        _db_connection.execute('PRAGMA journal_mode=WAL')
-    
-    try:
-        yield _db_connection
-        _db_connection.commit()
-    except Exception:
-        _db_connection.rollback()
-        raise
 from typing import List, Optional, Tuple
 
 DB_NAME = "trading_app.db"
 _db_lock = threading.RLock()
 
+
 @contextmanager
 def get_db():
-    """Context manager for database connection.
-    
-    Opens a dedicated connection for this operation and serializes access
-    with a lock to ensure thread-safe reads and writes.
+    """Create a database connection for a single operation.
+
+    The connection is opened per call, serialized by a re-entrant lock for
+    thread-safe reads and writes, and always closed before returning.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
         with _db_lock:
@@ -50,11 +27,13 @@ def get_db():
     finally:
         conn.close()
 
+
 def init_db():
     """Initialize database with optimized schema and indexes."""
     with get_db() as conn:
         c = conn.cursor()
-        c.execute('''
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -67,124 +46,109 @@ def init_db():
                 slippage REAL NOT NULL,
                 pnl REAL NOT NULL
             )
-        ''')
-        
-        # Add indexes for frequently queried columns
+            """
+        )
+
         c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_strategy ON trades(strategy)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_pnl ON trades(pnl)')
-        conn.commit()
+
 
 def save_trade(trade):
-    """Save a single trade using persistent connection."""
-
-def save_trade(trade):
-    """Save a single trade using a dedicated connection."""
+    """Save a single trade."""
     with get_db() as conn:
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO trades 
+        c.execute(
+            """
+            INSERT INTO trades
             (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            str(trade.timestamp),
-            trade.strategy,
-            trade.symbol,
-            trade.side,
-            trade.price,
-            trade.size,
-            trade.fees,
-            trade.slippage,
-            trade.pnl
-        ))
+            """,
+            (
+                str(trade.timestamp),
+                trade.strategy,
+                trade.symbol,
+                trade.side,
+                trade.price,
+                trade.size,
+                trade.fees,
+                trade.slippage,
+                trade.pnl,
+            ),
+        )
+
 
 def save_trades_batch(trades: List) -> int:
     """Batch insert trades for better performance.
-    
+
     Args:
         trades: List of TradeEvent objects
-        
+
     Returns:
         Number of trades inserted
     """
     with get_db() as conn:
         c = conn.cursor()
-        data = [(
-            str(trade.timestamp),
-            trade.strategy,
-            trade.symbol,
-            trade.side,
-            trade.price,
-            trade.size,
-            trade.fees,
-            trade.slippage,
-            trade.pnl
-        ) for trade in trades]
-        
-        c.executemany('''
-            INSERT INTO trades 
+        data = [
+            (
+                str(trade.timestamp),
+                trade.strategy,
+                trade.symbol,
+                trade.side,
+                trade.price,
+                trade.size,
+                trade.fees,
+                trade.slippage,
+                trade.pnl,
+            )
+            for trade in trades
+        ]
+
+        c.executemany(
+            """
+            INSERT INTO trades
             (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', data)
-        
+            """,
+            data,
+        )
+
         return len(trades)
 
+
 def get_trades(limit: int = 100, offset: int = 0) -> List[Tuple]:
-    """Get paginated trades.
-    
-    Args:
-        limit: Number of trades to return (default 100)
-        offset: Number of trades to skip (default 0)
-        
-    Returns:
-        List of trade tuples
-    """
+    """Get paginated trades."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (limit, offset)
+            (limit, offset),
         )
         return c.fetchall()
 
+
 def get_trades_by_symbol(symbol: str, limit: int = 100, offset: int = 0) -> List[Tuple]:
-    """Get paginated trades for a specific symbol.
-    
-    Args:
-        symbol: Trading symbol (e.g., 'BTCUSD')
-        limit: Number of trades to return
-        offset: Number of trades to skip
-        
-    Returns:
-        List of trade tuples
-    """
+    """Get paginated trades for a specific symbol."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (symbol, limit, offset)
+            (symbol, limit, offset),
         )
         return c.fetchall()
 
+
 def get_trades_by_strategy(strategy: str, limit: int = 100, offset: int = 0) -> List[Tuple]:
-    """Get paginated trades for a specific strategy.
-    
-    Args:
-        strategy: Strategy name
-        limit: Number of trades to return
-        offset: Number of trades to skip
-        
-    Returns:
-        List of trade tuples
-    """
+    """Get paginated trades for a specific strategy."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades WHERE strategy = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (strategy, limit, offset)
+            (strategy, limit, offset),
         )
         return c.fetchall()
+
 
 def get_total_pnl() -> float:
     """Get total realized P&L across all trades."""
@@ -194,35 +158,24 @@ def get_total_pnl() -> float:
         total = c.fetchone()[0]
         return total or 0.0
 
+
 def get_pnl_by_symbol(symbol: str) -> float:
-    """Get total P&L for a specific symbol.
-    
-    Args:
-        symbol: Trading symbol
-        
-    Returns:
-        Total P&L for the symbol
-    """
+    """Get total P&L for a specific symbol."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE symbol = ?", (symbol,))
         total = c.fetchone()[0]
         return total or 0.0
 
+
 def get_pnl_by_strategy(strategy: str) -> float:
-    """Get total P&L for a specific strategy.
-    
-    Args:
-        strategy: Strategy name
-        
-    Returns:
-        Total P&L for the strategy
-    """
+    """Get total P&L for a specific strategy."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE strategy = ?", (strategy,))
         total = c.fetchone()[0]
         return total or 0.0
+
 
 def get_trade_count() -> int:
     """Get total number of trades in database."""
@@ -231,17 +184,7 @@ def get_trade_count() -> int:
         c.execute("SELECT COUNT(*) FROM trades")
         return c.fetchone()[0] or 0
 
+
 def close_db():
-    """Close the persistent database connection.
-    
-    Call this during application shutdown.
-    """
-    global _db_connection
-    if _db_connection:
-        _db_connection.close()
-        _db_connection = None
-    """No-op for the per-operation connection pattern.
-    
-    Kept for backward compatibility with the main.py shutdown sequence.
-    """
-    pass
+    """No-op retained for backward compatibility with the shutdown sequence."""
+    return None
