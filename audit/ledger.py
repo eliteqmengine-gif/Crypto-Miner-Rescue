@@ -1,36 +1,83 @@
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 DB_NAME = "trading_app.db"
 _db_lock = threading.RLock()
 
 
-@contextmanager
-def get_db():
-    """Create a fresh DB connection for a single operation.
+@dataclass
+class TradeRecord:
+    timestamp: datetime
+    strategy: str
+    symbol: str
+    side: str
+    price: float
+    size: float
+    fees: float
+    slippage: float
+    pnl: float
 
-    Using a connection-per-operation avoids sharing a live sqlite3.Connection
-    across threads (unsafe). A process-wide reentrant lock serializes access
-    where required; WAL improves concurrency between readers and writers.
+
+def _format_timestamp(ts: Any) -> str:
+    """Normalize timestamp to ISO 8601 string for consistent ordering."""
+    if isinstance(ts, datetime):
+        return ts.isoformat()
+    return str(ts)
+
+
+def _with_retries(fn, max_retries: int = 5, base_delay: float = 0.05):
+    """Retry helper for transient sqlite errors (e.g. database is locked).
+
+    The wrapped function should perform the DB operation and return a value.
+    """
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" in msg or "database is locked" in msg or "busy" in msg:
+                time.sleep(base_delay * (2 ** attempt))
+                continue
+            raise
+    # final attempt - let exceptions bubble
+    return fn()
+
+
+@contextmanager
+def get_db(readonly: bool = False):
+    """Context manager providing a fresh sqlite3.Connection.
+
+    If readonly is False, a re-entrant lock is acquired to serialize writes.
+    WAL mode is set to improve concurrency between readers and writers. The
+    connection is always closed before returning to avoid cross-thread reuse.
     """
     conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     try:
-        with _db_lock:
+        if readonly:
             yield conn
-            conn.commit()
+        else:
+            with _db_lock:
+                yield conn
+                conn.commit()
     except Exception:
-        conn.rollback()
+        # Only rollback when there's an active transaction / writers
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
 
 
-def init_db():
-    """Initialize database with optimized schema and indexes."""
+def init_db() -> None:
+    """Initialize database schema and indexes."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
@@ -50,7 +97,7 @@ def init_db():
             """
         )
 
-        # single-column indexes (useful), plus composite indexes for common queries
+        # single-column indexes and composite indexes for common queries
         c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_strategy ON trades(strategy)')
@@ -59,71 +106,121 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_pnl ON trades(pnl)')
 
 
-def save_trade(trade) -> None:
-    """Save a single trade."""
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO trades
-            (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(trade.timestamp),
-                trade.strategy,
-                trade.symbol,
-                trade.side,
-                trade.price,
-                trade.size,
-                trade.fees,
-                trade.slippage,
-                trade.pnl,
-            ),
-        )
+def save_trade(trade: TradeRecord) -> None:
+    """Save a single trade with retries for transient failures."""
 
-
-def save_trades_batch(trades: List) -> int:
-    """Batch insert trades for better performance.
-
-    Args:
-        trades: List of trade-like objects (must have the expected attributes)
-
-    Returns:
-        Number of trades inserted
-    """
-    with get_db() as conn:
-        c = conn.cursor()
-        data = [
-            (
-                str(trade.timestamp),
-                trade.strategy,
-                trade.symbol,
-                trade.side,
-                trade.price,
-                trade.size,
-                trade.fees,
-                trade.slippage,
-                trade.pnl,
+    def _do():
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO trades
+                (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _format_timestamp(trade.timestamp),
+                    trade.strategy,
+                    trade.symbol,
+                    trade.side,
+                    float(trade.price),
+                    float(trade.size),
+                    float(trade.fees),
+                    float(trade.slippage),
+                    float(trade.pnl),
+                ),
             )
-            for trade in trades
-        ]
 
-        c.executemany(
-            """
-            INSERT INTO trades
-            (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            data,
-        )
+    _with_retries(_do)
 
-        return len(trades)
+
+def save_trades_batch(trades: Iterable[TradeRecord], chunk_size: int = 5000) -> int:
+    """Batch insert trades in internal chunks with retries.
+
+    Returns the total number of inserted rows.
+    """
+    total_inserted = 0
+
+    # Ensure we can iterate multiple times by consuming into small lists per chunk
+    batch = []
+    for tr in trades:
+        batch.append(tr)
+        if len(batch) >= chunk_size:
+            def _do_chunk(b=batch):
+                with get_db() as conn:
+                    c = conn.cursor()
+                    data = [
+                        (
+                            _format_timestamp(t.timestamp),
+                            t.strategy,
+                            t.symbol,
+                            t.side,
+                            float(t.price),
+                            float(t.size),
+                            float(t.fees),
+                            float(t.slippage),
+                            float(t.pnl),
+                        )
+                        for t in b
+                    ]
+                    c.executemany(
+                        """
+                        INSERT INTO trades
+                        (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        data,
+                    )
+            _with_retries(_do_chunk)
+            total_inserted += len(batch)
+            batch = []
+
+    # final partial batch
+    if batch:
+        def _do_final(b=batch):
+            with get_db() as conn:
+                c = conn.cursor()
+                data = [
+                    (
+                        _format_timestamp(t.timestamp),
+                        t.strategy,
+                        t.symbol,
+                        t.side,
+                        float(t.price),
+                        float(t.size),
+                        float(t.fees),
+                        float(t.slippage),
+                        float(t.pnl),
+                    )
+                    for t in b
+                ]
+                c.executemany(
+                    """
+                    INSERT INTO trades
+                    (timestamp, strategy, symbol, side, price, size, fees, slippage, pnl)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    data,
+                )
+        _with_retries(_do_final)
+        total_inserted += len(batch)
+
+    return total_inserted
+
+
+def _safe_scalar_fetch(cursor) -> Optional[float]:
+    row = cursor.fetchone()
+    if not row:
+        return None
+    v = row[0]
+    if v is None:
+        return None
+    return float(v)
 
 
 def get_trades(limit: int = 100, offset: int = 0) -> List[Tuple]:
     """Get paginated trades."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -134,7 +231,7 @@ def get_trades(limit: int = 100, offset: int = 0) -> List[Tuple]:
 
 def get_trades_by_symbol(symbol: str, limit: int = 100, offset: int = 0) -> List[Tuple]:
     """Get paginated trades for a specific symbol."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -145,7 +242,7 @@ def get_trades_by_symbol(symbol: str, limit: int = 100, offset: int = 0) -> List
 
 def get_trades_by_strategy(strategy: str, limit: int = 100, offset: int = 0) -> List[Tuple]:
     """Get paginated trades for a specific strategy."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM trades WHERE strategy = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -156,37 +253,38 @@ def get_trades_by_strategy(strategy: str, limit: int = 100, offset: int = 0) -> 
 
 def get_total_pnl() -> float:
     """Get total realized P&L across all trades."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades")
-        total = c.fetchone()[0]
+        total = _safe_scalar_fetch(c)
         return float(total or 0.0)
 
 
 def get_pnl_by_symbol(symbol: str) -> float:
     """Get total P&L for a specific symbol."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE symbol = ?", (symbol,))
-        total = c.fetchone()[0]
+        total = _safe_scalar_fetch(c)
         return float(total or 0.0)
 
 
 def get_pnl_by_strategy(strategy: str) -> float:
     """Get total P&L for a specific strategy."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE strategy = ?", (strategy,))
-        total = c.fetchone()[0]
+        total = _safe_scalar_fetch(c)
         return float(total or 0.0)
 
 
 def get_trade_count() -> int:
     """Get total number of trades in database."""
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM trades")
-        return int(c.fetchone()[0] or 0)
+        row = c.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
 
 def close_db():
