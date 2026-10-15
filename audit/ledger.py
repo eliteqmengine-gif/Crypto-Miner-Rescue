@@ -2,7 +2,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 DB_NAME = "trading_app.db"
 _db_lock = threading.RLock()
@@ -10,10 +10,11 @@ _db_lock = threading.RLock()
 
 @contextmanager
 def get_db():
-    """Create a database connection for a single operation.
+    """Create a fresh DB connection for a single operation.
 
-    The connection is opened per call, serialized by a re-entrant lock for
-    thread-safe reads and writes, and always closed before returning.
+    Using a connection-per-operation avoids sharing a live sqlite3.Connection
+    across threads (unsafe). A process-wide reentrant lock serializes access
+    where required; WAL improves concurrency between readers and writers.
     """
     conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -49,13 +50,16 @@ def init_db():
             """
         )
 
+        # single-column indexes (useful), plus composite indexes for common queries
         c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON trades(symbol)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_strategy ON trades(strategy)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON trades(symbol, timestamp DESC)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_strategy_timestamp ON trades(strategy, timestamp DESC)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_pnl ON trades(pnl)')
 
 
-def save_trade(trade):
+def save_trade(trade) -> None:
     """Save a single trade."""
     with get_db() as conn:
         c = conn.cursor()
@@ -83,7 +87,7 @@ def save_trades_batch(trades: List) -> int:
     """Batch insert trades for better performance.
 
     Args:
-        trades: List of TradeEvent objects
+        trades: List of trade-like objects (must have the expected attributes)
 
     Returns:
         Number of trades inserted
@@ -156,7 +160,7 @@ def get_total_pnl() -> float:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades")
         total = c.fetchone()[0]
-        return total or 0.0
+        return float(total or 0.0)
 
 
 def get_pnl_by_symbol(symbol: str) -> float:
@@ -165,7 +169,7 @@ def get_pnl_by_symbol(symbol: str) -> float:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE symbol = ?", (symbol,))
         total = c.fetchone()[0]
-        return total or 0.0
+        return float(total or 0.0)
 
 
 def get_pnl_by_strategy(strategy: str) -> float:
@@ -174,7 +178,7 @@ def get_pnl_by_strategy(strategy: str) -> float:
         c = conn.cursor()
         c.execute("SELECT SUM(pnl) FROM trades WHERE strategy = ?", (strategy,))
         total = c.fetchone()[0]
-        return total or 0.0
+        return float(total or 0.0)
 
 
 def get_trade_count() -> int:
@@ -182,7 +186,7 @@ def get_trade_count() -> int:
     with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM trades")
-        return c.fetchone()[0] or 0
+        return int(c.fetchone()[0] or 0)
 
 
 def close_db():
